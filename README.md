@@ -59,7 +59,8 @@ The full pipeline (scrape, ETL, ML, optimiser) runs from the repo root:
 python main.py
 ```
 
-Stages, in order:
+Stages, in order (todo - will need to be updated in future gameweeks):
+
 1. **Bronze**: scrape PlayFantasyRugby and Ultimate Rugby into `data/bronze/`.
 2. **Silver**: clean and join into player and fixture tables under `data/silver/`.
 3. **Gold**: build the feature panel at `data/gold/feature_panel.parquet`.
