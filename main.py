@@ -16,7 +16,7 @@ log = get_logger("super_rugby")
 def main() -> int:
     log.info("=== super-rugby pipeline start ===")
     try:
-        from src.scraping.fantasy_2 import main as scrape_bronze
+        from src.scraping.bronze import main as scrape_bronze
         from src.etl.silver import main as build_silver
         from src.etl.gold import main as build_gold
         from src.ml.walk_forward import main as run_walkforward

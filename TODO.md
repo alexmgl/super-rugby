@@ -106,7 +106,7 @@ Then re-enable `_compute_historical_priors()` in [src/etl/silver.py](src/etl/sil
 - Respect each source's `robots.txt` and TOS. RugbyPass and ESPN generally do
   not permit automated scraping in their TOS — read first.
 - Rate-limit (≥1 req / 2-5s, randomised) and cache HTML to
-  `data/bronze/raw/html_<source>/` like [src/scraping/fantasy_2.py](src/scraping/fantasy_2.py) does.
+  `data/bronze/raw/html_<source>/` like [src/scraping/bronze.py](src/scraping/bronze.py) does.
 - If this turns out to need more than weekly refresh or repeated anti-bot
   re-engineering, that's the signal to bite the bullet and pay for Stats
   Perform or Highlightly's paid tier instead.

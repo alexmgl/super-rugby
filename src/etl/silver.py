@@ -15,7 +15,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from src.scraping.fantasy_2 import (
+from src.scraping.bronze import (
     SQUAD_ABBR_TO_UR_SLUG,
     UR_TEAM_SLUG_TO_ABBR,
     parse_match_teams,
