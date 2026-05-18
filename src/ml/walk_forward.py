@@ -25,8 +25,10 @@ from src.ml.quantile_model import (
     calibration_report,
     ensure_categoricals,
     fit_for_round_calibrated,
+    fit_per_position_for_round,
     make_uncond_target,
     predict_quantiles,
+    predict_quantiles_per_position,
 )
 from src.milp.team_optimiser import SCENARIOS, build_optimal_team, compare_scenarios
 from src.utils.logger import get_logger
@@ -47,6 +49,11 @@ BANNED_STATUSES = {"injured", "not-selected", "eliminated"}
 #   {0.8}  (selective P80)           : 47.3% — but isotonic plateau breaks captain pick
 # Default: no calibration. Same backtest, better captain on round 15.
 CALIBRATE_QUANTILES: set[float] | None = set()
+
+# If True, fit one set of quantile models per position. Thin-position positions
+# (<50 train rows) fall back to a globally trained model. Empirically tested in
+# experiment: see ./walk_forward.py:main() output when toggled.
+PER_POSITION = False
 
 log = get_logger(__name__)
 
@@ -149,9 +156,14 @@ def select_team_for_round(
         panel["target_uncond"] = make_uncond_target(panel)
 
     try:
-        models, calibrators, info = fit_for_round_calibrated(
-            panel, target_round, calibrate_quantiles=CALIBRATE_QUANTILES,
-        )
+        if PER_POSITION:
+            models, calibrators, info = fit_per_position_for_round(
+                panel, target_round, calibrate_quantiles=CALIBRATE_QUANTILES,
+            )
+        else:
+            models, calibrators, info = fit_for_round_calibrated(
+                panel, target_round, calibrate_quantiles=CALIBRATE_QUANTILES,
+            )
     except ValueError as e:
         log.warning("round %d: %s", target_round, e)
         return None, None, None
@@ -160,7 +172,10 @@ def select_team_for_round(
     if pred_pool.empty:
         return None, None, None
 
-    qs = predict_quantiles(models, pred_pool[FEATURES], calibrators=calibrators)
+    if PER_POSITION:
+        qs = predict_quantiles_per_position(models, calibrators, pred_pool)
+    else:
+        qs = predict_quantiles(models, pred_pool[FEATURES], calibrators=calibrators)
     pred = pd.concat([pred_pool.reset_index(drop=True), qs.reset_index(drop=True)], axis=1)
     pred["cost"] = _cost_basis(pred)
 
@@ -261,7 +276,13 @@ def main() -> None:
                          "Default: try PFR live budget, fall back to $100M.")
     ap.add_argument("--skip-live-budget", action="store_true",
                     help="don't hit PFR for live budget; use default/passed value")
+    ap.add_argument("--per-position", action="store_true",
+                    help="fit one quantile-model set per position (experimental)")
     args = ap.parse_args()
+    if args.per_position:
+        global PER_POSITION
+        PER_POSITION = True
+        log.info("per-position training: ON")
 
     log.info("=== walk-forward + round-15 optimiser ===")
     panel = pd.read_parquet(GOLD_DIR / "feature_panel.parquet")

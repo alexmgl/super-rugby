@@ -290,6 +290,115 @@ def fit_for_round_calibrated(
     return models, calibrators, info
 
 
+def fit_per_position_for_round(
+    panel: pd.DataFrame, target_round: int,
+    calibrate_quantiles: set[float] | None = None,
+    min_train_rows: int = 50,
+) -> tuple[dict[str, dict], dict[str, dict | None], dict]:
+    """Per-position variant of `fit_for_round_calibrated`.
+
+    Trains an independent set of 5 quantile models for each position. At inference,
+    each player's predictions come from their position's model only.
+
+    Returns:
+        models_by_pos     : {position: {q: XGBRegressor}}
+        calibrators_by_pos: {position: {q: IsotonicRegression} or None}
+        info              : aggregate metadata (rows per position, fallback list, ...)
+
+    If a position has fewer than `min_train_rows` trainable rows for this target,
+    it falls back to a globally-trained quantile model (same as the non-per-position
+    path) so we don't dump cheap depth at thin-data positions.
+    """
+    panel = ensure_categoricals(panel)
+    if "target_uncond" not in panel.columns:
+        panel = panel.copy()
+        panel["target_uncond"] = make_uncond_target(panel)
+
+    train_pool = panel[(panel["round"] < target_round) & panel["target_uncond"].notna()].copy()
+    rounds = sorted(train_pool["round"].unique())
+    if len(rounds) < 3:
+        # Not enough to do per-position splits — return global as a single 'all' bucket
+        models, info = fit_for_round(panel, target_round)
+        return {"_all": models}, {"_all": None}, info
+
+    calib_round = rounds[-1]
+    val_round = rounds[-2]
+    train_rounds = rounds[:-2]
+
+    # First, fit a global model as the fallback for thin positions.
+    tr_g = train_pool[train_pool["round"].isin(train_rounds)]
+    va_g = train_pool[train_pool["round"] == val_round]
+    ca_g = train_pool[train_pool["round"] == calib_round]
+    global_models = train_quantile_models(tr_g[FEATURES], tr_g["target_uncond"],
+                                          va_g[FEATURES], va_g["target_uncond"])
+    global_calib = fit_calibrators(global_models, ca_g[FEATURES], ca_g["target_uncond"],
+                                   only_quantiles=calibrate_quantiles)
+
+    models_by_pos: dict[str, dict] = {}
+    calib_by_pos: dict[str, dict | None] = {}
+    rows_by_pos: dict[str, int] = {}
+    fallback_positions: list[str] = []
+
+    positions = sorted(panel["position"].astype(str).unique())
+    for pos in positions:
+        tr_p = tr_g[tr_g["position"].astype(str) == pos]
+        va_p = va_g[va_g["position"].astype(str) == pos]
+        ca_p = ca_g[ca_g["position"].astype(str) == pos]
+        rows_by_pos[pos] = len(tr_p)
+        if len(tr_p) < min_train_rows or len(va_p) < 5:
+            models_by_pos[pos] = global_models
+            calib_by_pos[pos] = global_calib
+            fallback_positions.append(pos)
+            continue
+
+        models = train_quantile_models(tr_p[FEATURES], tr_p["target_uncond"],
+                                       va_p[FEATURES], va_p["target_uncond"])
+        if len(ca_p) >= 5:
+            calibs = fit_calibrators(models, ca_p[FEATURES], ca_p["target_uncond"],
+                                     only_quantiles=calibrate_quantiles)
+        else:
+            calibs = None
+        models_by_pos[pos] = models
+        calib_by_pos[pos] = calibs
+
+    info = {
+        "target_round": target_round,
+        "train_rows": len(tr_g),
+        "val_rows": len(va_g),
+        "calib_rows": len(ca_g),
+        "rounds_in_train": train_rounds,
+        "val_round": int(val_round),
+        "calib_round": int(calib_round),
+        "calibrated": calibrate_quantiles != set(),
+        "per_position": True,
+        "rows_by_position": rows_by_pos,
+        "fallback_positions": fallback_positions,
+    }
+    return models_by_pos, calib_by_pos, info
+
+
+def predict_quantiles_per_position(
+    models_by_pos: dict[str, dict],
+    calibrators_by_pos: dict[str, dict | None],
+    panel_subset: pd.DataFrame,
+    enforce_monotone: bool = True,
+) -> pd.DataFrame:
+    """Predict P-quantiles routing each row to the model trained for its position.
+
+    Returns a DataFrame indexed like `panel_subset` with p50..p90 columns.
+    """
+    out_chunks = []
+    for pos, group in panel_subset.groupby(panel_subset["position"].astype(str), sort=False):
+        models = models_by_pos.get(pos) or models_by_pos["_all"]
+        calibs = calibrators_by_pos.get(pos) if calibrators_by_pos else None
+        preds = predict_quantiles(models, group[FEATURES], calibrators=calibs,
+                                  enforce_monotone=enforce_monotone)
+        preds.index = group.index
+        out_chunks.append(preds)
+    full = pd.concat(out_chunks).reindex(panel_subset.index)
+    return full
+
+
 def main() -> None:
     """Train + emit round-15 quantile predictions."""
     log.info("=== quantile model: P50/60/70/80/90 ===")

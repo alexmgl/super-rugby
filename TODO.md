@@ -38,6 +38,24 @@ reveal calibration artefacts faster than a single Spearman / oracle-% number.
 Walk-forward already saves these to `data/gold/optimal_team_round15_<chip>.parquet`
 each run; just diff between calibration variants.
 
+## Revisit per-position models with richer data
+
+Tested 2026-05-18 against the global-model baseline of 55.6% of oracle:
+**per-position came in at 54.0% (−1.6pp)** despite each position having 450–950
+cumulative training rows by R14. The fattest position (loose_forward, 952 rows)
+already splits across 5 quantile models; thin positions (hooker, fly_half,
+scrum_half at ~450 rows) overfit and produce volatile captain picks (round 10
+dropped to 40% of oracle vs 62% for the global model).
+
+Code/flag is preserved — `PER_POSITION` in [src/ml/walk_forward.py](src/ml/walk_forward.py)
+plus `fit_per_position_for_round` / `predict_quantiles_per_position` in
+[src/ml/quantile_model.py](src/ml/quantile_model.py). Re-run via
+`python -m src.ml.walk_forward --per-position`.
+
+Revisit when each position has ~1,500+ cumulative training rows (likely after
+one more full season) — at that point the position-specific signal should
+overcome the row-budget penalty.
+
 ## Volatility + box-score features (highest-leverage remaining model gain)
 
 Currently `pts_roll3_std` is the only volatility signal. Adding `pts_roll5_std`,
