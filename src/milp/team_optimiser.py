@@ -47,7 +47,7 @@ DEFAULT_POSITION_COUNTS = {
 }
 DEFAULT_TEAM_SIZE = sum(DEFAULT_POSITION_COUNTS.values())  # 15
 DEFAULT_BUDGET = 100_000_000       # NZ$100M — PFR opening cap; configurable
-DEFAULT_MAX_PER_SQUAD = 5          # standard fantasy cap
+DEFAULT_MAX_PER_SQUAD = 4          # PFR cap (confirmed empirically — 5 returns 400 fantasy.team.max_count)
 
 
 def build_optimal_team(

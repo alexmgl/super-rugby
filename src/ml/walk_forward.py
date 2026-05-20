@@ -38,6 +38,13 @@ from src.utils.paths import GOLD_DIR, SILVER_DIR
 # PFR status values that we should filter OUT of the candidate pool at inference.
 BANNED_STATUSES = {"injured", "not-selected", "eliminated"}
 
+# If non-empty, restricts the round-15 candidate pool to ONLY these statuses.
+# Once squads are announced, PFR populates "starting" / "bench" on each player.
+# Set this to the announced-only set so the optimiser does not consider rotated
+# players. Earlier in the week (status="uncertain"), leave as set() and the
+# BANNED_STATUSES list above is used instead.
+ALLOWED_STATUSES: set[str] = {"starting", "bench"}
+
 # Selective calibration: only calibrate the captain quantile (P80). Team (P60) stays
 # raw to preserve mid-tier discrimination — full calibration creates isotonic plateaus
 # that collapse mid-tier predictions onto a few discrete levels, pushing the optimiser
@@ -190,11 +197,15 @@ def select_team_for_round(
                  target_round, n_before, len(optim_in), n_before - len(optim_in))
 
     if apply_status_filter:
-        active = players_dim[~players_dim["status"].fillna("").isin(BANNED_STATUSES)]
+        if ALLOWED_STATUSES:
+            active = players_dim[players_dim["status"].fillna("").isin(ALLOWED_STATUSES)]
+            label = f"in {sorted(ALLOWED_STATUSES)}"
+        else:
+            active = players_dim[~players_dim["status"].fillna("").isin(BANNED_STATUSES)]
+            label = f"not in {sorted(BANNED_STATUSES)}"
         n_before = len(optim_in)
         optim_in = optim_in[optim_in["player_id"].isin(active["player_id"])]
-        log.info("status filter: %d -> %d candidates (dropped %d injured/not-selected/eliminated)",
-                 n_before, len(optim_in), n_before - len(optim_in))
+        log.info("status filter (%s): %d -> %d candidates", label, n_before, len(optim_in))
 
         manual = _load_manual_exclusions(target_round)
         if manual:
