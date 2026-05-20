@@ -203,3 +203,8 @@ desktop.ini
 
 # Application logs
 /logs/
+
+
+# images
+*.png
+*.jpg   
