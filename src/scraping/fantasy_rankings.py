@@ -18,8 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
@@ -31,12 +30,13 @@ log = get_logger(__name__)
 
 RANKING_URL = "https://www.playfantasyrugby.com/api/en/fantasy/ranking"
 MAX_PAGES = 100  # PFR caps at 2000 entries = 100 pages of 20
-SLEEP_BETWEEN = 0.2  # polite pacing
+MAX_WORKERS = 16  # concurrent page requests per round (requests.Session is thread-safe for GETs)
 
 RAW_DIR = BRONZE_DIR / "raw"
 
 
 def fetch_page(session, page: int, round_id: int | None = None, retries: int = 3):
+    import time as _time
     params = {"page": page}
     if round_id is not None:
         params["round"] = round_id
@@ -48,22 +48,39 @@ def fetch_page(session, page: int, round_id: int | None = None, retries: int = 3
             return r.json()["success"]
         except Exception as e:
             last_err = e
-            time.sleep(1.5 * (attempt + 1))
+            _time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"page {page} round {round_id} failed: {last_err}")
 
 
 def fetch_all_pages(session, round_id: int | None = None) -> list[dict]:
-    """Paginate from page 1 until the API returns no rows."""
+    """Fetch all 100 pages concurrently via a thread pool, preserving page order.
+
+    PFR caps the leaderboard at 2000 entries (= 100 pages of 20), so we fire all
+    MAX_PAGES requests in parallel rather than paginating serially. Pages past
+    the actual cutoff return empty `rankings` arrays and are dropped.
+
+    Using requests.Session across threads is safe for GETs — the adapter pool
+    holds connections; concurrent reads do not mutate session state.
+    """
+    results: dict[int, list[dict]] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {
+            ex.submit(fetch_page, session, p, round_id): p
+            for p in range(1, MAX_PAGES + 1)
+        }
+        for fut in as_completed(futures):
+            p = futures[fut]
+            try:
+                data = fut.result()
+                results[p] = data.get("rankings", [])
+            except Exception as e:
+                log.warning("page %d round %s failed: %s", p, round_id, e)
+                results[p] = []
+
+    # Re-assemble in page order so caller sees the ranked list in rank order.
     rows: list[dict] = []
-    for p in range(1, MAX_PAGES + 1):
-        data = fetch_page(session, p, round_id=round_id)
-        rks = data.get("rankings", [])
-        if not rks:
-            break
-        rows.extend(rks)
-        if not data.get("nextPage"):
-            break
-        time.sleep(SLEEP_BETWEEN)
+    for p in sorted(results):
+        rows.extend(results[p])
     return rows
 
 
@@ -115,7 +132,17 @@ def main() -> None:
 
     if args.rounds:
         if args.rounds.lower() == "all":
-            rounds = list(range(1, 15))
+            # Dynamic: every round that has played at least once, per fantasy_rounds.csv.
+            rounds_path = BRONZE_DIR / "fantasy_rounds.csv"
+            if rounds_path.exists():
+                rdf = pd.read_csv(rounds_path)
+                rounds = sorted(
+                    rdf.loc[rdf["status"].isin(["completed", "playing"]), "number"].astype(int).tolist()
+                )
+                log.info("--rounds all -> %s (status in completed/playing)", rounds)
+            else:
+                rounds = list(range(1, 16))
+                log.warning("no fantasy_rounds.csv; defaulting to 1..15")
         else:
             rounds = [int(x) for x in args.rounds.split(",") if x.strip()]
         scrape_per_round(s, rounds)

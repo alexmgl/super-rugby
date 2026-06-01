@@ -57,6 +57,13 @@ ALLOWED_STATUSES: set[str] = {"starting", "bench"}
 # Default: no calibration. Same backtest, better captain on round 15.
 CALIBRATE_QUANTILES: set[float] | None = set()
 
+# Which quantile column to use for captain selection.
+# A/B-tested 2026-06-01: p90 beat p80 by +1.4pp on full-season walk-forward
+# (57.62% vs 56.23% of oracle). The higher ceiling catches boom potential —
+# wins like McKenzie@R9 (+12pp) and Fineanganofo@R11 (+8pp) outweigh the losses
+# from extra captain churn.
+CAPTAIN_QUANTILE_COL = "p90"
+
 # If True, fit one set of quantile models per position. Thin-position positions
 # (<50 train rows) fall back to a globally trained model. Empirically tested in
 # experiment: see ./walk_forward.py:main() output when toggled.
@@ -179,14 +186,21 @@ def select_team_for_round(
     if pred_pool.empty:
         return None, None, None
 
+    feats = info.get("active_features", FEATURES) if info else FEATURES
     if PER_POSITION:
-        qs = predict_quantiles_per_position(models, calibrators, pred_pool)
+        qs = predict_quantiles_per_position(models, calibrators, pred_pool, features=feats)
     else:
-        qs = predict_quantiles(models, pred_pool[FEATURES], calibrators=calibrators)
+        qs = predict_quantiles(models, pred_pool[feats], calibrators=calibrators)
     pred = pd.concat([pred_pool.reset_index(drop=True), qs.reset_index(drop=True)], axis=1)
     pred["cost"] = _cost_basis(pred)
 
-    optim_in = pred[["player_id", "position", "squad_id", "cost", "p60", "p80"]].dropna()
+    captain_col = CAPTAIN_QUANTILE_COL
+    proj_cols = ["player_id", "position", "squad_id", "cost", "p60", captain_col]
+    if captain_col == "p80":
+        optim_in = pred[proj_cols].dropna()
+    else:
+        # Carry both p80 (for enrichment/logging) and the chosen captain column.
+        optim_in = pred[proj_cols + (["p80"] if "p80" not in proj_cols else [])].dropna()
 
     if filter_to_observed:
         # Assume we knew the starting lineup at MILP time — drop players who DNP'd this round.
@@ -219,6 +233,8 @@ def select_team_for_round(
         return None, info, None
 
     build_kwargs = {} if budget is None else {"budget": budget}
+    if captain_col != "p80":
+        build_kwargs["p80_col"] = captain_col
     team = build_optimal_team(optim_in, **build_kwargs)
     team = _enrich_team(team, players_dim, pred)
     info["optim_pool"] = optim_in  # keep for scenario comparison
@@ -310,9 +326,9 @@ def main() -> None:
     log.info("budget for round-15 optimiser: %s",
              f"${budget/1e6:.1f}M" if budget else "optimiser default")
 
-    # 1) walk-forward through completed rounds 2..14
+    # 1) walk-forward through completed rounds 2..15
     log.info("\n--- WALK-FORWARD ---")
-    summary = walk_forward(panel, players_dim, start_round=2, end_round=14)
+    summary = walk_forward(panel, players_dim, start_round=2, end_round=15)
     if not summary.empty:
         out_path = GOLD_DIR / "walk_forward_summary.parquet"
         summary.to_parquet(out_path, index=False)
@@ -327,15 +343,15 @@ def main() -> None:
         log.info("Model captured %.1f%% of the oracle's points across %d rounds",
                  100 * summary["actual_pts"].sum() / summary["oracle_pts"].sum(), len(summary))
 
-    # 2) Round 15 — the next-GW recommendation, with status filter + scenario comparison
-    log.info("\n--- predicting round 15 (next GW) — status filter ON ---")
+    # 2) Round 16 — the next-GW recommendation, with status filter + scenario comparison
+    log.info("\n--- predicting round 16 (next GW) — status filter ON ---")
     team_15, info_15, _ = select_team_for_round(
-        panel, 15, players_dim,
+        panel, 16, players_dim,
         apply_status_filter=True, return_models=True,
         budget=budget,
     )
     if team_15 is not None:
-        out_path = GOLD_DIR / "optimal_team_round15.parquet"
+        out_path = GOLD_DIR / "optimal_team_round16.parquet"
         team_15.to_parquet(out_path, index=False)
         captain = team_15[team_15["is_captain"]].iloc[0]
         log.info("[normal] objective=%.1f budget=$%.1fM captain=%s %s (2*P80=%.1f)",
@@ -357,11 +373,13 @@ def main() -> None:
         optim_in = info_15["optim_pool"] if info_15 else None
         if optim_in is not None:
             scenario_kwargs = {"budget": budget} if budget else {}
+            if CAPTAIN_QUANTILE_COL != "p80":
+                scenario_kwargs["p80_col"] = CAPTAIN_QUANTILE_COL
             scenarios = compare_scenarios(optim_in, **scenario_kwargs)
             rows = []
             for name, team in scenarios.items():
                 team_e = _enrich_team(team, players_dim, info_15["pred"])
-                team_e.to_parquet(GOLD_DIR / f"optimal_team_round15_{name}.parquet", index=False)
+                team_e.to_parquet(GOLD_DIR / f"optimal_team_round16_{name}.parquet", index=False)
                 caps = team_e[team_e["is_captain"]]
                 rows.append({
                     "scenario": name,

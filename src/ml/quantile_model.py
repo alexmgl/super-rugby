@@ -26,6 +26,14 @@ FEATURES = [
     "pts_lag1", "pts_lag2", "pts_lag3",
     "pts_roll3_mean", "pts_roll5_mean", "pts_roll3_std",
     "pts_roll5_max", "pts_roll5_min",
+    # Volatility / boom-bust shape — A/B-tested 2026-06-01 and hurt by -2.8pp.
+    # Boom-share defined among PLAYED games failed to penalise DNP-prone players
+    # (model picked Tevita Ofa, Jorgensen-over-Ratumaitavuki etc.). Revisit with:
+    #   - threshold tuning (50 too high, 10 too low for SRP fantasy);
+    #   - definition that penalises rotation risk (boom_share * appearance_rate);
+    #   - removal of pts_cv_l5 (extreme outliers at small means).
+    # Code in add_volatility_features() stays for future re-test.
+    # "pts_roll5_std", "boom_share_l5", "bust_share_l5", "pts_cv_l5", "boom_minus_bust",
     "pts_season_total", "games_played", "pts_per_game_season",
     "price_lag1", "price_delta_3", "ownership_lag1", "ownership_delta_3",
     "team_attack_3", "team_defense_3", "team_fantasy_3",
@@ -42,9 +50,37 @@ FEATURES = [
     "fixture_total_implied", "fixture_margin_implied", "is_forward",
     # Travel — haversine km from each team's home stadium to this fixture's venue
     "own_travel_km", "opp_travel_km", "travel_advantage_km",
+    # Announced-XV form aggregates (this-week lineup strength; rotation/rest signal)
+    "own_xv_form_sum", "opp_xv_form_sum", "xv_form_advantage",
+    "own_pack_form_sum", "opp_pack_form_sum", "pack_form_advantage",
+    "own_backs_form_sum", "opp_backs_form_sum", "backs_form_advantage",
+    "own_sh_form", "opp_sh_form", "sh_form_advantage",
+    "own_fh_form", "opp_fh_form", "fh_form_advantage",
+    # Relative-to-peers form (z-scores within position/squad + season rank).
+    # Gated by training-pool depth — see `get_active_features` / `MIN_TRAIN_ROUNDS_FOR_Z`.
+    "pts_roll5_z_pos", "pts_roll5_z_squad",
+    "pts_per_game_z_pos", "pts_per_game_rank_pos",
+    "ownership_z_pos",
 ]
 CATEGORICAL = ["position", "squad_id", "opponent_squad_id"]
 QUANTILES = (0.5, 0.6, 0.7, 0.8, 0.9)
+
+# Z-score features need ≥N rounds of per-position rolling-form data to produce
+# stable σ denominators. Empirically: including them with <10 training rounds
+# hurts walk-forward by ~4pp (R2–R11); from R12+ they add small positive signal.
+Z_SCORE_FEATURES = {
+    "pts_roll5_z_pos", "pts_roll5_z_squad",
+    "pts_per_game_z_pos", "pts_per_game_rank_pos",
+    "ownership_z_pos",
+}
+MIN_TRAIN_ROUNDS_FOR_Z = 10
+
+
+def get_active_features(n_train_rounds: int) -> list[str]:
+    """Return the feature list, dropping z-score features when training pool is thin."""
+    if n_train_rounds < MIN_TRAIN_ROUNDS_FOR_Z:
+        return [f for f in FEATURES if f not in Z_SCORE_FEATURES]
+    return list(FEATURES)
 
 BASE_PARAMS = dict(
     n_estimators=500,
@@ -215,8 +251,10 @@ def fit_for_round(panel: pd.DataFrame, target_round: int) -> tuple[dict, dict]:
         raise ValueError(f"too little training data for round {target_round}: only {len(train_pool)} rows")
 
     tr, va = _inner_split(train_pool)
-    X_tr, y_tr = tr[FEATURES], tr["target_uncond"]
-    X_va, y_va = va[FEATURES], va["target_uncond"]
+    n_train_rounds = tr["round"].nunique()
+    active_features = get_active_features(n_train_rounds)
+    X_tr, y_tr = tr[active_features], tr["target_uncond"]
+    X_va, y_va = va[active_features], va["target_uncond"]
 
     models = train_quantile_models(X_tr, y_tr, X_va, y_va)
     info = {
@@ -226,6 +264,7 @@ def fit_for_round(panel: pd.DataFrame, target_round: int) -> tuple[dict, dict]:
         "rounds_in_train": sorted(tr["round"].unique().tolist()),
         "val_round": int(va["round"].iloc[0]) if len(va) else None,
         "calibrated": False,
+        "active_features": active_features,
     }
     return models, info
 
@@ -269,9 +308,10 @@ def fit_for_round_calibrated(
     va = train_pool[train_pool["round"] == val_round]
     ca = train_pool[train_pool["round"] == calib_round]
 
-    X_tr, y_tr = tr[FEATURES], tr["target_uncond"]
-    X_va, y_va = va[FEATURES], va["target_uncond"]
-    X_ca, y_ca = ca[FEATURES], ca["target_uncond"]
+    active_features = get_active_features(len(train_rounds))
+    X_tr, y_tr = tr[active_features], tr["target_uncond"]
+    X_va, y_va = va[active_features], va["target_uncond"]
+    X_ca, y_ca = ca[active_features], ca["target_uncond"]
 
     models = train_quantile_models(X_tr, y_tr, X_va, y_va)
     calibrators = fit_calibrators(models, X_ca, y_ca, only_quantiles=calibrate_quantiles)
@@ -286,6 +326,7 @@ def fit_for_round_calibrated(
         "calib_round": int(calib_round),
         "calibrated": True,
         "calibrated_quantiles": sorted(calibrators.keys()),
+        "active_features": active_features,
     }
     return models, calibrators, info
 
@@ -329,9 +370,10 @@ def fit_per_position_for_round(
     tr_g = train_pool[train_pool["round"].isin(train_rounds)]
     va_g = train_pool[train_pool["round"] == val_round]
     ca_g = train_pool[train_pool["round"] == calib_round]
-    global_models = train_quantile_models(tr_g[FEATURES], tr_g["target_uncond"],
-                                          va_g[FEATURES], va_g["target_uncond"])
-    global_calib = fit_calibrators(global_models, ca_g[FEATURES], ca_g["target_uncond"],
+    active_features = get_active_features(len(train_rounds))
+    global_models = train_quantile_models(tr_g[active_features], tr_g["target_uncond"],
+                                          va_g[active_features], va_g["target_uncond"])
+    global_calib = fit_calibrators(global_models, ca_g[active_features], ca_g["target_uncond"],
                                    only_quantiles=calibrate_quantiles)
 
     models_by_pos: dict[str, dict] = {}
@@ -351,10 +393,10 @@ def fit_per_position_for_round(
             fallback_positions.append(pos)
             continue
 
-        models = train_quantile_models(tr_p[FEATURES], tr_p["target_uncond"],
-                                       va_p[FEATURES], va_p["target_uncond"])
+        models = train_quantile_models(tr_p[active_features], tr_p["target_uncond"],
+                                       va_p[active_features], va_p["target_uncond"])
         if len(ca_p) >= 5:
-            calibs = fit_calibrators(models, ca_p[FEATURES], ca_p["target_uncond"],
+            calibs = fit_calibrators(models, ca_p[active_features], ca_p["target_uncond"],
                                      only_quantiles=calibrate_quantiles)
         else:
             calibs = None
@@ -373,6 +415,7 @@ def fit_per_position_for_round(
         "per_position": True,
         "rows_by_position": rows_by_pos,
         "fallback_positions": fallback_positions,
+        "active_features": active_features,
     }
     return models_by_pos, calib_by_pos, info
 
@@ -382,16 +425,18 @@ def predict_quantiles_per_position(
     calibrators_by_pos: dict[str, dict | None],
     panel_subset: pd.DataFrame,
     enforce_monotone: bool = True,
+    features: list[str] | None = None,
 ) -> pd.DataFrame:
     """Predict P-quantiles routing each row to the model trained for its position.
 
     Returns a DataFrame indexed like `panel_subset` with p50..p90 columns.
     """
+    feats = features if features is not None else FEATURES
     out_chunks = []
     for pos, group in panel_subset.groupby(panel_subset["position"].astype(str), sort=False):
         models = models_by_pos.get(pos) or models_by_pos["_all"]
         calibs = calibrators_by_pos.get(pos) if calibrators_by_pos else None
-        preds = predict_quantiles(models, group[FEATURES], calibrators=calibs,
+        preds = predict_quantiles(models, group[feats], calibrators=calibs,
                                   enforce_monotone=enforce_monotone)
         preds.index = group.index
         out_chunks.append(preds)

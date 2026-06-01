@@ -45,6 +45,53 @@ def add_player_form_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Boom/bust shape of recent scoring — what captain P80 actually wants to know.
+
+    `pts_roll3_std` and `pts_roll5_mean` capture spread and level, but not the
+    SHAPE of the distribution. A player who oscillates 80/5/80/5/80 has the same
+    P50 as one who scores 42 every week, but vastly different captain value.
+
+    All features are leakage-free (shift-then-roll). Boom/bust indicators are
+    set to NaN for DNP rounds so the rolling share measures booms/busts
+    AMONG GAMES ACTUALLY PLAYED (DNP risk is captured by `dnp_share_l3` already).
+
+    Adds:
+        pts_roll5_std    — std of last 5 played-game scores (the 5-game version
+                            of the existing pts_roll3_std)
+        boom_share_l5    — share of last 5 played games with points ≥ 50
+        bust_share_l5    — share of last 5 played games with points ≤ 10
+        pts_cv_l5        — coefficient of variation = pts_roll5_std / |pts_roll5_mean|
+        boom_minus_bust  — boom_share_l5 − bust_share_l5, in [-1, 1]
+    """
+    df = df.sort_values(["player_id", "round"]).reset_index(drop=True).copy()
+    g_pts = df.groupby("player_id", sort=False)["points"]
+
+    df["pts_roll5_std"] = g_pts.transform(
+        lambda s: s.shift(1).rolling(5, min_periods=2).std()
+    )
+
+    # Boom/bust flags: 1 if played + threshold crossed, 0 if played + not, NaN if DNP.
+    played = df["points"].notna()
+    df["_boom"] = (df["points"] >= 50).astype("float64").where(played)
+    df["_bust"] = (df["points"] <= 10).astype("float64").where(played)
+
+    df["boom_share_l5"] = df.groupby("player_id", sort=False)["_boom"].transform(
+        lambda s: s.shift(1).rolling(5, min_periods=1).mean()
+    )
+    df["bust_share_l5"] = df.groupby("player_id", sort=False)["_bust"].transform(
+        lambda s: s.shift(1).rolling(5, min_periods=1).mean()
+    )
+
+    # CoV = std / |mean|. Mean ≈ 0 (rare; usually DNP-heavy player) → NaN.
+    mean_safe = df["pts_roll5_mean"].abs().replace(0, float("nan"))
+    df["pts_cv_l5"] = df["pts_roll5_std"] / mean_safe
+
+    df["boom_minus_bust"] = df["boom_share_l5"] - df["bust_share_l5"]
+
+    return df.drop(columns=["_boom", "_bust"])
+
+
 def add_market_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["player_id", "round"]).reset_index(drop=True).copy()
     gp = df.groupby("player_id", sort=False)["price"]
@@ -213,6 +260,156 @@ def add_positional_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# Position groupings for matchup aggregates.
+PACK_POSITIONS = {"prop", "hooker", "lock", "loose_forward"}
+BACKS_POSITIONS = {"scrum_half", "fly_half", "center", "outside_back"}
+
+
+def add_announced_xv_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregates of `pts_roll5_mean` over each round's announced starting XV.
+
+    Captures this-week lineup strength (rotation, rest, key absentees) — features
+    that the lagged team-form aggregates miss.
+
+    Two sources of starter info:
+      - historical rounds : `lineup_role == 'start'` from ur_match_lineups
+      - forecast round    : fall back to `status == 'starting'` (the live PFR snapshot)
+
+    For each (squad, round) we compute:
+      own_xv_form_sum     — Σ pts_roll5_mean over all starting XV
+      own_pack_form_sum   — Σ over forwards (prop, hooker, lock, loose_forward)
+      own_backs_form_sum  — Σ over backs   (scrum_half, fly_half, center, outside_back)
+      own_sh_form         — max pts_roll5_mean among starting scrum-halves
+      own_fh_form         — max pts_roll5_mean among starting fly-halves
+
+    Mirrored as opp_* via the opponent's squad_id, then differenced into 5
+    *_form_advantage features. Leakage-free: pts_roll5_mean is already shift-then-roll.
+    """
+    df = df.copy()
+    role = df.get("lineup_role")
+    status = df.get("status")
+    max_round = int(df["round"].max())
+
+    is_start_hist = (role == "start") if role is not None else pd.Series(False, index=df.index)
+    # CRITICAL: `status` is a single per-player snapshot (latest scrape) — it only
+    # describes the upcoming round, not arbitrary historical ones. So the live-status
+    # fallback is gated to the prediction round (max round in panel) only. Any other
+    # round with missing lineup_role keeps features NaN — no backfill from a future state.
+    is_start_live = (
+        (status == "starting") & (df["round"] == max_round)
+    ) if status is not None else pd.Series(False, index=df.index)
+    has_lineup = role.notna() if role is not None else pd.Series(False, index=df.index)
+
+    df["_is_starter_round"] = is_start_hist | ((~has_lineup) & is_start_live)
+
+    starters = df[df["_is_starter_round"]].copy()
+    starters["_form"] = starters["pts_roll5_mean"].fillna(0.0)
+    starters["_pos_str"] = starters["position"].astype(str)
+
+    def _agg(group: pd.DataFrame) -> pd.Series:
+        forms = group["_form"]
+        positions = group["_pos_str"]
+        pack_mask = positions.isin(PACK_POSITIONS)
+        backs_mask = positions.isin(BACKS_POSITIONS)
+        sh_mask = positions == "scrum_half"
+        fh_mask = positions == "fly_half"
+        return pd.Series({
+            "own_xv_form_sum": forms.sum(),
+            "own_pack_form_sum": forms[pack_mask].sum(),
+            "own_backs_form_sum": forms[backs_mask].sum(),
+            "own_sh_form": forms[sh_mask].max() if sh_mask.any() else float("nan"),
+            "own_fh_form": forms[fh_mask].max() if fh_mask.any() else float("nan"),
+        })
+
+    if starters.empty:
+        # Nothing to aggregate; attach NaN columns and exit.
+        for col in ["own_xv_form_sum", "own_pack_form_sum", "own_backs_form_sum",
+                    "own_sh_form", "own_fh_form",
+                    "opp_xv_form_sum", "opp_pack_form_sum", "opp_backs_form_sum",
+                    "opp_sh_form", "opp_fh_form",
+                    "xv_form_advantage", "pack_form_advantage", "backs_form_advantage",
+                    "sh_form_advantage", "fh_form_advantage"]:
+            df[col] = float("nan")
+        return df.drop(columns=["_is_starter_round"], errors="ignore")
+
+    own = (
+        starters.groupby(["squad_id", "round"], observed=True)
+                .apply(_agg)
+                .reset_index()
+    )
+
+    df = df.merge(own, on=["squad_id", "round"], how="left")
+
+    opp = own.rename(columns={
+        "squad_id": "opponent_squad_id",
+        "own_xv_form_sum": "opp_xv_form_sum",
+        "own_pack_form_sum": "opp_pack_form_sum",
+        "own_backs_form_sum": "opp_backs_form_sum",
+        "own_sh_form": "opp_sh_form",
+        "own_fh_form": "opp_fh_form",
+    })
+    df = df.merge(opp, on=["opponent_squad_id", "round"], how="left")
+
+    df["xv_form_advantage"] = df["own_xv_form_sum"] - df["opp_xv_form_sum"]
+    df["pack_form_advantage"] = df["own_pack_form_sum"] - df["opp_pack_form_sum"]
+    df["backs_form_advantage"] = df["own_backs_form_sum"] - df["opp_backs_form_sum"]
+    df["sh_form_advantage"] = df["own_sh_form"] - df["opp_sh_form"]
+    df["fh_form_advantage"] = df["own_fh_form"] - df["opp_fh_form"]
+
+    return df.drop(columns=["_is_starter_round"], errors="ignore")
+
+
+def add_relative_form_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Z-scores + ranks of form/ownership within (round, position) and (round, squad).
+
+    Captures relative-to-peers signal that trees can't easily derive from absolute
+    thresholds (a 25-pt SH is exceptional; a 25-pt LF is mid-tier — same threshold,
+    very different meaning).
+
+    Inputs are leakage-free (shift-then-roll), so the derived stats inherit that
+    property. Per-group std uses a floor of 5.0 to stabilise thin slices
+    (e.g. ~10 SHs per round; a few NaNs make raw σ unstable).
+
+    Adds:
+        pts_roll5_z_pos       — z of pts_roll5_mean within (round, position)
+        pts_roll5_z_squad     — z of pts_roll5_mean within (round, squad)
+        pts_per_game_z_pos    — z of pts_per_game_season within (round, position)
+        pts_per_game_rank_pos — integer rank in position by season pts/game (1 = best)
+        ownership_z_pos       — z of ownership_lag1 within (round, position)
+    """
+    df = df.copy()
+    # Sigma floor stabilises σ when per-group sample size is small. A more principled
+    # alternative — Empirical-Bayes shrinkage pooling sample variance toward the
+    # global variance with prior strength k — was A/B-tested (2026-06-01) at
+    # k=20 and produced statistically indistinguishable results from the floor
+    # (56.08% vs 56.23% of oracle, 4 rounds of active z-scores). Floor kept for
+    # simplicity; revisit if a future test shows otherwise.
+    SIGMA_FLOOR = 5.0
+
+    def _zscore(group_cols: list[str], value_col: str, out_name: str) -> None:
+        if value_col not in df.columns:
+            return
+        grouped = df.groupby(group_cols, observed=True)[value_col]
+        mean = grouped.transform("mean")
+        std = grouped.transform("std")
+        std_shrunk = std.clip(lower=SIGMA_FLOOR)
+        df[out_name] = (df[value_col] - mean) / std_shrunk
+
+    def _rank(group_cols: list[str], value_col: str, out_name: str) -> None:
+        if value_col not in df.columns:
+            return
+        df[out_name] = df.groupby(group_cols, observed=True)[value_col].rank(
+            method="min", ascending=False, na_option="keep"
+        )
+
+    _zscore(["round", "position"], "pts_roll5_mean", "pts_roll5_z_pos")
+    _zscore(["round", "squad_id"], "pts_roll5_mean", "pts_roll5_z_squad")
+    _zscore(["round", "position"], "pts_per_game_season", "pts_per_game_z_pos")
+    _rank(["round", "position"], "pts_per_game_season", "pts_per_game_rank_pos")
+    _zscore(["round", "position"], "ownership_lag1", "ownership_z_pos")
+    return df
+
+
 def add_static_player_features(df: pd.DataFrame, players_dim: pd.DataFrame) -> pd.DataFrame:
     """Join static UR bio + career features onto each panel row.
 
@@ -260,6 +457,7 @@ def build_feature_panel(
 ) -> pd.DataFrame:
     df = player_rounds.copy()
     df = add_player_form_features(df)
+    df = add_volatility_features(df)
     df = add_market_features(df)
     df = add_schedule_features(df)
     df = add_team_features(df, team_rounds)
@@ -268,6 +466,8 @@ def build_feature_panel(
     df = add_team_composition_features(df, players_dim, team_rounds)
     df = add_fixture_style_features(df)
     df = add_positional_features(df)
+    df = add_announced_xv_features(df)
+    df = add_relative_form_features(df)
 
     df["target_points"] = df["points"]
 
