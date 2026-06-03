@@ -326,9 +326,9 @@ def main() -> None:
     log.info("budget for round-15 optimiser: %s",
              f"${budget/1e6:.1f}M" if budget else "optimiser default")
 
-    # 1) walk-forward through completed rounds 2..15
+    # 1) walk-forward through completed rounds 2..16 (full season)
     log.info("\n--- WALK-FORWARD ---")
-    summary = walk_forward(panel, players_dim, start_round=2, end_round=15)
+    summary = walk_forward(panel, players_dim, start_round=2, end_round=16)
     if not summary.empty:
         out_path = GOLD_DIR / "walk_forward_summary.parquet"
         summary.to_parquet(out_path, index=False)
